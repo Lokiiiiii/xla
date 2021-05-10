@@ -55,6 +55,7 @@ FLAGS = args_parse.parse_common_options(
 )
 
 import os
+import time
 import schedulers
 import numpy as np
 import torch
@@ -72,6 +73,10 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.test.test_utils as test_utils
 from classification_benchmark_constants import MODEL_SPECIFIC_DEFAULTS, DEFAULT_KWARGS
 from torch_xla.amp import autocast, GradScaler
+
+
+p95 = lambda x:np.percentile(x, 95)
+
 
 # Set any args that were not explicitly given by the user.
 default_value_dict = MODEL_SPECIFIC_DEFAULTS.get(FLAGS.model, DEFAULT_KWARGS)
@@ -116,13 +121,14 @@ def train_imagenet():
             ),
             sample_count=train_dataset_len // FLAGS.batch_size // xm.xrt_world_size(),
         )
-        test_loader = xu.SampleGenerator(
-            data=(
-                torch.zeros(FLAGS.test_set_batch_size, 3, img_dim, img_dim),
-                torch.zeros(FLAGS.test_set_batch_size, dtype=torch.int64),
-            ),
-            sample_count=50000 // FLAGS.batch_size // xm.xrt_world_size(),
-        )
+        if FLAGS.validate:
+            test_loader = xu.SampleGenerator(
+                data=(
+                    torch.zeros(FLAGS.test_set_batch_size, 3, img_dim, img_dim),
+                    torch.zeros(FLAGS.test_set_batch_size, dtype=torch.int64),
+                ),
+                sample_count=50000 // FLAGS.batch_size // xm.xrt_world_size(),
+            )
     else:
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         train_dataset = torchvision.datasets.ImageFolder(
@@ -138,29 +144,31 @@ def train_imagenet():
         )
         train_dataset_len = len(train_dataset.imgs)
         resize_dim = max(img_dim, 256)
-        test_dataset = torchvision.datasets.ImageFolder(
-            os.path.join(FLAGS.datadir, "val"),
-            # Matches Torchvision's eval transforms except Torchvision uses size
-            # 256 resize for all models both here and in the train loader. Their
-            # version crashes during training on 299x299 images, e.g. inception.
-            transforms.Compose(
-                [
-                    transforms.Resize(resize_dim),
-                    transforms.CenterCrop(img_dim),
-                    transforms.ToTensor(),
-                    normalize,
-                ]
-            ),
-        )
+        if FLAGS.validate:
+            test_dataset = torchvision.datasets.ImageFolder(
+                os.path.join(FLAGS.datadir, "val"),
+                # Matches Torchvision's eval transforms except Torchvision uses size
+                # 256 resize for all models both here and in the train loader. Their
+                # version crashes during training on 299x299 images, e.g. inception.
+                transforms.Compose(
+                    [
+                        transforms.Resize(resize_dim),
+                        transforms.CenterCrop(img_dim),
+                        transforms.ToTensor(),
+                        normalize,
+                    ]
+                ),
+            )
 
         train_sampler, test_sampler = None, None
         if xm.xrt_world_size() > 1:
             train_sampler = torch.utils.data.distributed.DistributedSampler(
                 train_dataset, num_replicas=xm.xrt_world_size(), rank=xm.get_ordinal(), shuffle=True
             )
-            test_sampler = torch.utils.data.distributed.DistributedSampler(
-                test_dataset, num_replicas=xm.xrt_world_size(), rank=xm.get_ordinal(), shuffle=False
-            )
+            if FLAGS.validate:
+                test_sampler = torch.utils.data.distributed.DistributedSampler(
+                    test_dataset, num_replicas=xm.xrt_world_size(), rank=xm.get_ordinal(), shuffle=False
+                )
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=FLAGS.batch_size,
@@ -169,14 +177,15 @@ def train_imagenet():
             shuffle=False if train_sampler else True,
             num_workers=FLAGS.num_workers,
         )
-        test_loader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=FLAGS.test_set_batch_size,
-            sampler=test_sampler,
-            drop_last=FLAGS.drop_last,
-            shuffle=False,
-            num_workers=FLAGS.num_workers,
-        )
+        if FLAGS.validate:
+            test_loader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=FLAGS.test_set_batch_size,
+                sampler=test_sampler,
+                drop_last=FLAGS.drop_last,
+                shuffle=False,
+                num_workers=FLAGS.num_workers,
+            )
 
     torch.manual_seed(42)
 
@@ -201,28 +210,59 @@ def train_imagenet():
     scaler = GradScaler()
 
     def train_loop_fn(loader, epoch):
-        tracker = xm.RateTracker()
+        if FLAGS.fine_grained_metrics:
+            epoch_start_time = time.time()
+            step_latency_tracker, bwd_latency_tracker, fwd_latency_tracker = [], [], []
+        else:
+            tracker = xm.RateTracker()
         model.train()
         for step, (data, target) in enumerate(loader):
+            if FLAGS.fine_grained_metrics:
+                step_start_time = time.time()
             optimizer.zero_grad()
+            if FLAGS.fine_grained_metrics:
+                fwd_start_time = time.time()
             with autocast():
                 output = model(data)
                 loss = loss_fn(output, target)
+            if FLAGS.fine_grained_metrics:
+                fwd_end_time = time.time()
+                fwd_latency = fwd_end_time - fwd_start_time
 
+                bwd_start_time = time.time()
             scaler.scale(loss).backward()
             gradients = xm._fetch_gradients(optimizer)
             xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
             scaler.step(optimizer)
             scaler.update()
             xm.mark_step()
-            tracker.add(FLAGS.batch_size)
             if lr_scheduler:
                 lr_scheduler.step()
+            if FLAGS.fine_grained_metrics:
+                bwd_end_time = time.time()
+                bwd_latency = bwd_end_time - bwd_start_time
+
+                step_latency = bwd_end_time - step_start_time
+                step_latency_tracker.append(step_latency)
+                bwd_latency_tracker.append(bwd_latency)
+                fwd_latency_tracker.append(fwd_latency)
+            else:
+                tracker.add(FLAGS.batch_size)
             if step % FLAGS.log_steps == 0:
-                # _train_update(device, step, loss, tracker, epoch, writer)
-                xm.add_step_closure(
-                    _train_update, args=(device, step, loss, tracker, epoch, writer)
-                )
+                if FLAGS.fine_grained_metrics:
+                    print('FineGrainedMetrics :: Epoch={} Step={} Rate(DataPoints/s)[p95]={} BatchSize={} Step(s/Batch)[p95]={} Fwd(s/Batch)[p95]={} Bwd(s/Batch)[p95]={}'.format(\
+                                                epoch, step, FLAGS.batch_size/p95(step_latency_tracker), FLAGS.batch_size, p95(step_latency_tracker), p95(bwd_latency_tracker), p95(fwd_latency_tracker)))
+                else:
+                    # _train_update(device, step, loss, tracker, epoch, writer)
+                    xm.add_step_closure(
+                        _train_update, args=(device, step, loss, tracker, epoch, writer)
+                    )
+        if FLAGS.fine_grained_metrics:
+            epoch_end_time = time.time()
+            epoch_latency = epoch_end_time - epoch_start_time
+            print('FineGrainedMetrics :: Epoch={} Epoch(s)={} Rate(DataPoints/s)[p95]={} BatchSize={} Step(s/Batch)[p95]={} Fwd(s/Batch)[p95]={} Bwd(s/Batch)[p95]={}'.format(\
+                                            epoch, epoch_latency, FLAGS.batch_size/p95(step_latency_tracker), FLAGS.batch_size, p95(step_latency_tracker), p95(bwd_latency_tracker), p95(fwd_latency_tracker)))
+
 
     def test_loop_fn(loader, epoch):
         total_samples, correct = 0, 0
@@ -240,26 +280,29 @@ def train_imagenet():
         return accuracy
 
     train_device_loader = pl.MpDeviceLoader(train_loader, device)
-    test_device_loader = pl.MpDeviceLoader(test_loader, device)
-    accuracy, max_accuracy = 0.0, 0.0
+    if FLAGS.validate:
+        test_device_loader = pl.MpDeviceLoader(test_loader, device)
+        accuracy, max_accuracy = 0.0, 0.0
     for epoch in range(1, FLAGS.num_epochs + 1):
         xm.master_print("Epoch {} train begin {}".format(epoch, test_utils.now()))
         train_loop_fn(train_device_loader, epoch)
         xm.master_print("Epoch {} train end {}".format(epoch, test_utils.now()))
-        accuracy = test_loop_fn(test_device_loader, epoch)
-        xm.master_print(
-            "Epoch {} test end {}, Accuracy={:.2f}".format(epoch, test_utils.now(), accuracy)
-        )
-        max_accuracy = max(accuracy, max_accuracy)
-        test_utils.write_to_summary(
-            writer, epoch, dict_to_write={"Accuracy/test": accuracy}, write_xla_metrics=True
-        )
+        if FLAGS.validate:
+            accuracy = test_loop_fn(test_device_loader, epoch)
+            xm.master_print(
+                "Epoch {} test end {}, Accuracy={:.2f}".format(epoch, test_utils.now(), accuracy)
+            )
+            max_accuracy = max(accuracy, max_accuracy)
+            test_utils.write_to_summary(
+                writer, epoch, dict_to_write={"Accuracy/test": accuracy}, write_xla_metrics=True
+            )
         if FLAGS.metrics_debug:
             xm.master_print(met.metrics_report())
 
     test_utils.close_summary_writer(writer)
-    xm.master_print("Max Accuracy: {:.2f}%".format(max_accuracy))
-    return max_accuracy
+    if FLAGS.validate:
+        xm.master_print("Max Accuracy: {:.2f}%".format(max_accuracy))
+    return max_accuracy if FLAGS.validate else None
 
 
 def _mp_fn(index, flags):
@@ -267,7 +310,7 @@ def _mp_fn(index, flags):
     FLAGS = flags
     torch.set_default_tensor_type("torch.FloatTensor")
     accuracy = train_imagenet()
-    if accuracy < FLAGS.target_accuracy:
+    if accuracy and accuracy < FLAGS.target_accuracy:
         print("Accuracy {} is below target {}".format(accuracy, FLAGS.target_accuracy))
         sys.exit(21)
 

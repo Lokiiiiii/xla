@@ -29,6 +29,8 @@ def parse_common_options(datadir=None,
   parser.add_argument('--momentum', type=float, default=momentum)
   parser.add_argument('--target_accuracy', type=float, default=target_accuracy)
   parser.add_argument('--drop_last', action='store_true')
+  parser.add_argument('--validate', action='store_true')
+  parser.add_argument('--fine_grained_metrics', action='store_true')
   parser.add_argument('--fake_data', action='store_true')
   parser.add_argument('--tidy', action='store_true')
   parser.add_argument('--metrics_debug', action='store_true')
