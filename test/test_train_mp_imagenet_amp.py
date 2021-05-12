@@ -75,7 +75,7 @@ from classification_benchmark_constants import MODEL_SPECIFIC_DEFAULTS, DEFAULT_
 from torch_xla.amp import autocast, GradScaler
 
 
-p95 = lambda x:np.percentile(x, 95)
+p50 = lambda x:np.percentile(x, 50)
 
 
 # Set any args that were not explicitly given by the user.
@@ -187,8 +187,6 @@ def train_imagenet():
                 num_workers=FLAGS.num_workers,
             )
 
-    torch.manual_seed(42)
-
     device = xm.xla_device()
     model = get_model_property("model_fn")().to(device)
     writer = None
@@ -250,8 +248,8 @@ def train_imagenet():
                 tracker.add(FLAGS.batch_size)
             if step % FLAGS.log_steps == 0:
                 if FLAGS.fine_grained_metrics:
-                    print('FineGrainedMetrics :: Epoch={} Step={} Rate(DataPoints/s)[p95]={} BatchSize={} Step(s/Batch)[p95]={} Fwd(s/Batch)[p95]={} Bwd(s/Batch)[p95]={}'.format(\
-                                                epoch, step, FLAGS.batch_size/p95(step_latency_tracker), FLAGS.batch_size, p95(step_latency_tracker), p95(bwd_latency_tracker), p95(fwd_latency_tracker)))
+                    print('FineGrainedMetrics :: Epoch={} Step={} Rate(DataPoints/s)[p50]={:.1f} BatchSize={} Step(s/Batch)[p50]={:.2f} Fwd(s/Batch)[p50]={:.4f} Bwd(s/Batch)[p50]={:.4f}'.format(\
+                                                epoch, step, FLAGS.batch_size/p50(step_latency_tracker), FLAGS.batch_size, p50(step_latency_tracker), p50(bwd_latency_tracker), p50(fwd_latency_tracker)))
                 else:
                     # _train_update(device, step, loss, tracker, epoch, writer)
                     xm.add_step_closure(
@@ -260,8 +258,8 @@ def train_imagenet():
         if FLAGS.fine_grained_metrics:
             epoch_end_time = time.time()
             epoch_latency = epoch_end_time - epoch_start_time
-            print('FineGrainedMetrics :: Epoch={} Epoch(s)={} Rate(DataPoints/s)[p95]={} BatchSize={} Step(s/Batch)[p95]={} Fwd(s/Batch)[p95]={} Bwd(s/Batch)[p95]={}'.format(\
-                                            epoch, epoch_latency, FLAGS.batch_size/p95(step_latency_tracker), FLAGS.batch_size, p95(step_latency_tracker), p95(bwd_latency_tracker), p95(fwd_latency_tracker)))
+            print('FineGrainedMetrics :: Epoch={} Epoch(s)={:.} Rate(DataPoints/s)[p50]={:.1f} BatchSize={} Step(s/Batch)[p50]={:.2f} Fwd(s/Batch)[p50]={:.4f} Bwd(s/Batch)[p50]={:.4f}'.format(\
+                                            epoch, epoch_latency, FLAGS.batch_size/p50(step_latency_tracker), FLAGS.batch_size, p50(step_latency_tracker), p50(bwd_latency_tracker), p50(fwd_latency_tracker)))
 
 
     def test_loop_fn(loader, epoch):
